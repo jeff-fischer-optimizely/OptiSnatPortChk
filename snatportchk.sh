@@ -32,9 +32,8 @@
 # script reports lookup status and timing as it works, and (in active mode) runs
 # tcpdump only as long as needed to obtain the name.
 #
-# Download & run:
-#   curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh
-#   sudo ./snatportchk.sh            # tcpdump needs root/CAP_NET_RAW
+# Download & run (one-liner; tcpdump needs root/CAP_NET_RAW):
+#   curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 # =============================================================================
 
 set -uo pipefail

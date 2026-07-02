@@ -10,11 +10,14 @@ with the real `hostname:port` discovered by sniffing TLS handshakes locally.
 
 ---
 
-## Install (one-liner)
+## Install & run (one-liner)
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 ```
+
+Add `--active` (or `-p`) to that trailing `sudo ./snatportchk.sh` as needed —
+see [Run](#run) below.
 
 ## Run
 
