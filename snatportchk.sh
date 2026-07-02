@@ -205,6 +205,7 @@ echo ""
 # Argument parsing (kept from the original)
 # ---------------------------------------------------------------------------
 GROUP_BY_PID=0
+VERBOSE=0             # --verbose/-v: show per-poll diagnostics; default keeps just the table
 # Default is PASSIVE only. Self-probing opens our own connections to the remote
 # IPs, which both pollutes the netstat view (extra ESTABLISHED/TIME_WAIT rows)
 # and consumes SNAT/ephemeral ports -- the very thing this tool is used to
@@ -218,10 +219,16 @@ for arg in "$@"; do
         --active|-a)          PROBE_ENABLED=1 ;;
         # Explicitly passive (this is the default).
         --passive|--no-probe) PROBE_ENABLED=0 ;;
+        # Show the per-poll diagnostic chatter (collector heartbeat, probe status,
+        # unresolved notes). Default keeps the output to just the table.
+        --verbose|-v)         VERBOSE=1 ;;
     esac
 done
 # No trigger tool means we can't self-probe -- don't pretend we can.
 [[ -z "$TRIGGER_TOOL" ]] && PROBE_ENABLED=0
+
+# vlog: echo only in --verbose mode. Used to gate per-poll diagnostics.
+vlog() { [[ "$VERBOSE" -eq 1 ]] && printf '%s\n' "$*"; return 0; }
 
 # ---------------------------------------------------------------------------
 # trigger_handshake <ip> <port> <keylog>
@@ -349,7 +356,7 @@ merge_collector() {
             added=$((added+1))
         fi
     done < "$MAP_FILE"
-    (( added > 0 )) && echo "  [async] merged ${added} new mapping(s) from background collector."
+    (( added > 0 )) && vlog "  [async] merged ${added} new mapping(s) from background collector."
     return 0
 }
 
@@ -388,10 +395,12 @@ probe_ip() {
     elapsed=$(( SECONDS - start ))
 
     printf '%s' "$name" > "$resultfile"
-    if [[ -n "$name" ]]; then
-        printf '  [probe] %-21s -> %s  (%ss)\n' "$ip" "$name" "$elapsed" >&2
-    else
-        printf '  [probe] %-21s -> (no DNS found)  (%ss)\n' "$ip" "$elapsed" >&2
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        if [[ -n "$name" ]]; then
+            printf '  [probe] %-21s -> %s  (%ss)\n' "$ip" "$name" "$elapsed" >&2
+        else
+            printf '  [probe] %-21s -> (no DNS found)  (%ss)\n' "$ip" "$elapsed" >&2
+        fi
     fi
     rm -f "$pcap" "$keylog"
 }
@@ -455,8 +464,8 @@ sleep "${COLLECTOR_WARMUP:-3}"
 echo ""
 
 while true; do
-    echo "Polling current connections (excluding INBOUND on 80/443/2222)..."
-    echo ""
+    vlog "Polling current connections (excluding INBOUND on 80/443/2222)..."
+    vlog ""
 
     # Fold anything the async collector has already discovered into the cache.
     merge_collector
@@ -466,17 +475,17 @@ while true; do
     # "no new handshakes yet".
     obs=$(wc -l < "$MAP_FILE" 2>/dev/null); obs=${obs//[^0-9]/}; obs=${obs:-0}
     if ! kill -0 "$COLLECTOR_PID" 2>/dev/null; then
+        # A dead collector is a real failure -- always surface it.
         echo "  [async] WARNING: background collector is NOT running (it exited). Last stderr:"
         tail -n 3 "$COLLECTOR_ERR" 2>/dev/null | sed 's/^/            /'
-    elif (( obs == 0 )); then
-        echo "  [async] collector running, 0 handshakes captured yet (fine if the app"
-        echo "          hasn't opened a NEW TLS connection since start)."
-        if [[ -s "$COLLECTOR_ERR" ]]; then
-            echo "          collector stderr so far:"
-            tail -n 3 "$COLLECTOR_ERR" 2>/dev/null | sed 's/^/            /'
+    elif [[ "$VERBOSE" -eq 1 ]]; then
+        if (( obs == 0 )); then
+            echo "  [async] collector running, 0 handshakes captured yet (fine if the app"
+            echo "          hasn't opened a NEW TLS connection since start)."
+            [[ -s "$COLLECTOR_ERR" ]] && { echo "          collector stderr so far:"; tail -n 3 "$COLLECTOR_ERR" 2>/dev/null | sed 's/^/            /'; }
+        else
+            echo "  [async] collector has captured ${obs} TLS handshake(s) so far."
         fi
-    else
-        echo "  [async] collector has captured ${obs} TLS handshake(s) so far."
     fi
 
     # --- Snapshot netstat into tab-separated rows: remote \t pid \t prog \t total \t states
@@ -543,7 +552,7 @@ while true; do
     done
 
     total_unique=${#SEEN_THIS_POLL[@]}
-    echo "Resolving ${total_unique} unique remote host(s): ${cached_count} from cache, ${new_count} unresolved."
+    vlog "Resolving ${total_unique} unique remote host(s): ${cached_count} from cache, ${new_count} unresolved."
     resolve_start=$SECONDS
 
     # --- Decide (in the parent) which IPs to actively probe this poll. All the
@@ -569,7 +578,7 @@ while true; do
 
     # --- Fire the probes in parallel, capped at MAX_PARALLEL concurrent workers.
     if (( ${#PROBE_IPS[@]} > 0 )); then
-        echo "Self-probing ${#PROBE_IPS[@]} host(s), up to ${MAX_PARALLEL} in parallel..."
+        vlog "Self-probing ${#PROBE_IPS[@]} host(s), up to ${MAX_PARALLEL} in parallel..."
         declare -a PROBE_PIDS=()
         local_running=0
         for i in "${!PROBE_IPS[@]}"; do
@@ -594,8 +603,8 @@ while true; do
         done
     fi
     resolve_elapsed=$(( SECONDS - resolve_start ))
-    echo "Resolution pass complete in ${resolve_elapsed}s."
-    echo ""
+    vlog "Resolution pass complete in ${resolve_elapsed}s."
+    vlog ""
 
     # --- Render the enriched table: IP, DNS, and Service(Port) as columns.
     printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "Remote IP" "DNS" "Service (Port)" "PID" "Process" "Total" "States (Count)"
@@ -620,16 +629,18 @@ while true; do
     done
 
     printf '%.0s-' {1..140}; echo
-    if (( unresolved > 0 )); then
-        echo "Note: ${unresolved} row(s) still show a raw IP -- the app hasn't opened a"
-        echo "      NEW TLS connection to them since start (or they're non-TLS). Names"
-        echo "      fill in as connections recycle; leave it running."
-        if [[ "$PROBE_ENABLED" -ne 1 ]]; then
-            echo "      Add --active to actively probe stragglers (opens connections)."
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        if (( unresolved > 0 )); then
+            echo "Note: ${unresolved} row(s) still show a raw IP -- the app hasn't opened a"
+            echo "      NEW TLS connection to them since start (or they're non-TLS). Names"
+            echo "      fill in as connections recycle; leave it running."
+            if [[ "$PROBE_ENABLED" -ne 1 ]]; then
+                echo "      Add --active to actively probe stragglers (opens connections)."
+            fi
         fi
+        echo "Cache now holds ${#NAME_CACHE[@]} IP->DNS mapping(s)."
     fi
-    echo "Cache now holds ${#NAME_CACHE[@]} IP->DNS mapping(s)."
-    echo "Press 'q' or Ctrl-C to quit; refreshing in ${POLL_INTERVAL}s..."
+    echo "Press 'q' or Ctrl-C to quit; refreshing in ${POLL_INTERVAL}s... (--verbose for details)"
     echo ""
     if ! wait_or_quit "$POLL_INTERVAL"; then
         echo "Stopping at your request -- shutting down capture and cleaning up..."

@@ -43,8 +43,9 @@ See [Run](#run) below for what each flag does.
 ```bash
 sudo ./snatportchk.sh              # sudo/root is required — tcpdump needs raw sockets
 sudo ./snatportchk.sh --pid        # (alias: -p / --group-by-pid) group rows by PID, like the original
-sudo ./snatportchk.sh --active     # (or -a) self-probe immediately (PROBE_DELAY=0), no grace period
-sudo ./snatportchk.sh --passive    # (or --no-probe) never self-probe; passive collector only
+sudo ./snatportchk.sh --active     # (or -a) enable the active self-probe fallback (off by default)
+sudo ./snatportchk.sh --passive    # (or --no-probe) never self-probe; passive collector only (default)
+sudo ./snatportchk.sh --verbose    # (or -v) show per-poll diagnostics; default prints just the table
 ```
 
 **To stop:** press **`q`** (or **Ctrl-C**) — either one shuts down the background
