@@ -36,7 +36,11 @@
 #   curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 # =============================================================================
 
-set -uo pipefail
+# NOTE: 'nounset' (set -u) is intentionally NOT used. Even on bash 5.2,
+# referencing an empty associative array -- e.g. ${#NAME_CACHE[@]} when nothing
+# has resolved yet -- aborts with "unbound variable" under set -u. This script
+# relies on empty arrays being valid, so we keep pipefail but omit nounset.
+set -o pipefail
 
 # ---------------------------------------------------------------------------
 # Tunables (override via environment)
