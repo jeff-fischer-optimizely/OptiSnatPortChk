@@ -205,13 +205,18 @@ echo ""
 # Argument parsing (kept from the original)
 # ---------------------------------------------------------------------------
 GROUP_BY_PID=0
-PROBE_ENABLED=1       # auto-probe an IP ourselves once passive has had PROBE_DELAY to name it
+# Default is PASSIVE only. Self-probing opens our own connections to the remote
+# IPs, which both pollutes the netstat view (extra ESTABLISHED/TIME_WAIT rows)
+# and consumes SNAT/ephemeral ports -- the very thing this tool is used to
+# diagnose. Passive SNI capture names almost everything without touching the
+# network, so probing is opt-in via --active.
+PROBE_ENABLED=0
 for arg in "$@"; do
     case "$arg" in
         --group-by-pid|--pid|-p) GROUP_BY_PID=1 ;;
-        # Probe immediately instead of waiting out the grace period.
-        --active|-a)          PROBE_DELAY=0 ;;
-        # Disable self-probing entirely: passive collector only.
+        # Enable the active self-probe fallback (see PROBE_DELAY for the grace period).
+        --active|-a)          PROBE_ENABLED=1 ;;
+        # Explicitly passive (this is the default).
         --passive|--no-probe) PROBE_ENABLED=0 ;;
     esac
 done
@@ -310,35 +315,33 @@ COLLECTOR_CAPFILTER="${COLLECTOR_CAPFILTER:-tcp}"
 # ---------------------------------------------------------------------------
 # start_collector
 #   Launch the ASYNC background collector: tshark captures live on the wire and
-#   emits "ip.dst<TAB>SNI" for every TLS ClientHello (any port). tshark does the
-#   capture itself (no tcpdump|tshark pipe -- that pipe could buffer until EOF on
-#   some builds and emit nothing). Each mapping is appended to $MAP_FILE. Runs in
-#   parallel from startup so the app's own handshakes are harvested immediately.
+#   writes "ip.dst|ipv6.dst|SNI" for every TLS ClientHello (any port) STRAIGHT to
+#   $MAP_FILE. tshark does the capture itself (no tcpdump|tshark pipe that could
+#   buffer to EOF) and we write directly to the file (no shell 'while read' in the
+#   hot path). The '|' separator is deliberate: with a TAB separator, bash 'read'
+#   collapses the empty ipv6.dst field for IPv4 rows and mangles the SNI.
 # ---------------------------------------------------------------------------
 start_collector() {
-    (
-        $SUDO tshark -i "$CAPTURE_IFACE" -l -f "$COLLECTOR_CAPFILTER" \
-            -Y 'tls.handshake.extensions_server_name' \
-            -T fields -e ip.dst -e ipv6.dst \
-            -e tls.handshake.extensions_server_name 2>>"$COLLECTOR_ERR" \
-        | while IFS=$'\t' read -r ip4 ip6 sni; do
-              ip="${ip4:-$ip6}"
-              sni="${sni%%,*}"
-              [[ -n "$ip" && -n "$sni" ]] && printf '%s\t%s\n' "$ip" "$sni" >> "$MAP_FILE"
-          done
-    ) &
+    $SUDO tshark -i "$CAPTURE_IFACE" -l -f "$COLLECTOR_CAPFILTER" \
+        -Y 'tls.handshake.extensions_server_name' \
+        -T fields -E 'separator=|' \
+        -e ip.dst -e ipv6.dst -e tls.handshake.extensions_server_name \
+        >> "$MAP_FILE" 2>>"$COLLECTOR_ERR" &
     COLLECTOR_PID=$!
 }
 
 # ---------------------------------------------------------------------------
 # merge_collector
-#   Fold any hostnames the async collector has discovered into the in-memory
-#   cache. Cheap (small file, cache dedups), so it runs every poll.
+#   Fold hostnames the collector has written into the in-memory cache. Parses the
+#   raw "ip4|ipv6|sni" lines with IFS='|' (a non-whitespace separator, so empty
+#   fields are preserved). Cheap (cache dedups), so it runs every poll.
 # ---------------------------------------------------------------------------
 merge_collector() {
     [[ -s "$MAP_FILE" ]] || return 0
-    local ip name added=0
-    while IFS=$'\t' read -r ip name; do
+    local ip4 ip6 sni ip name added=0
+    while IFS='|' read -r ip4 ip6 sni; do
+        ip="${ip4:-$ip6}"
+        name="${sni%%,*}"
         [[ -n "$ip" && -n "$name" ]] || continue
         if [[ -z "${NAME_CACHE[$ip]+x}" ]]; then
             NAME_CACHE[$ip]="$name"
@@ -615,9 +618,12 @@ while true; do
 
     printf '%.0s-' {1..122}; echo
     if (( unresolved > 0 )); then
-        echo "Note: ${unresolved} row(s) still show a raw IP -- no TLS name was obtained"
-        echo "      (non-TLS port, handshake not captured, or server sent no usable cert)."
-        echo "      These are retried automatically after ${NEG_RETRY_WINDOW}s."
+        echo "Note: ${unresolved} row(s) still show a raw IP -- the app hasn't opened a"
+        echo "      NEW TLS connection to them since start (or they're non-TLS). Names"
+        echo "      fill in as connections recycle; leave it running."
+        if [[ "$PROBE_ENABLED" -ne 1 ]]; then
+            echo "      Add --active to actively probe stragglers (opens connections)."
+        fi
     fi
     echo "Cache now holds ${#NAME_CACHE[@]} IP->DNS mapping(s)."
     echo "Press 'q' or Ctrl-C to quit; refreshing in ${POLL_INTERVAL}s..."
