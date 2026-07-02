@@ -12,10 +12,16 @@ with the real `hostname:port` discovered by sniffing TLS handshakes locally.
 
 ## Install & run (one-liner)
 
-Default (passive first, auto-probe after a 10s grace period):
+Default (passive — names come from the app's own TLS handshakes):
 
 ```bash
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
+```
+
+**Only `TIME_WAIT` connections, with active probing** (the SNAT-port-pressure view):
+
+```bash
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active --tcp-state TIME_WAIT
 ```
 
 Group rows by PID (`--pid`, alias of `-p` / `--group-by-pid`):
@@ -24,39 +30,29 @@ Group rows by PID (`--pid`, alias of `-p` / `--group-by-pid`):
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid
 ```
 
-Probe immediately, no grace period (`-a` / `--active`):
-
-```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active
-```
-
-Passive only, never self-probe (`--passive` / `--no-probe`):
-
-```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --passive
-```
-
 See [Run](#run) below for what each flag does.
 
 ## Run
 
 ```bash
-sudo ./snatportchk.sh              # sudo/root is required — tcpdump needs raw sockets
-sudo ./snatportchk.sh --pid        # (alias: -p / --group-by-pid) group rows by PID, like the original
-sudo ./snatportchk.sh --active     # (or -a) enable the active self-probe fallback (off by default)
-sudo ./snatportchk.sh --passive    # (or --no-probe) never self-probe; passive collector only (default)
-sudo ./snatportchk.sh --verbose    # (or -v) show per-poll diagnostics; default prints just the table
+sudo ./snatportchk.sh                       # sudo/root is required — tcpdump needs raw sockets
+sudo ./snatportchk.sh --pid                 # (alias: -p / --group-by-pid) group rows by PID, like the original
+sudo ./snatportchk.sh --active              # (or -a) enable the active self-probe fallback (off by default)
+sudo ./snatportchk.sh --passive             # (or --no-probe) passive collector only (this is the default)
+sudo ./snatportchk.sh --tcp-state TIME_WAIT # only show connections in this state (comma-separate for several)
+sudo ./snatportchk.sh --verbose             # (or -v) show per-poll diagnostics; default prints just the table
 ```
 
 **To stop:** press **`q`** (or **Ctrl-C**) — either one shuts down the background
 capture, stops tshark/tcpdump, and removes the temp files cleanly.
 
-By default the script is **passive first**: an IP is named from the application's
-own TLS handshake if one is seen within `PROBE_DELAY` seconds (default 10). If it
-stays unresolved past that window, the script **self-probes** it — opens a
-connection and reads the server certificate. Passive names are exact (real SNI);
-probe names are approximate (no SNI sent). Use `--active` to probe immediately or
-`--passive` to disable probing entirely.
+By default the script is **passive**: an IP is named from the application's own
+TLS handshake (exact, real SNI), which resolves nearly everything without touching
+the network. Add `--active` to also **self-probe** IPs still unresolved after
+`PROBE_DELAY` seconds (default 10; set `PROBE_DELAY=0` to probe immediately) — that
+opens a connection and reads the server certificate (approximate, no SNI sent),
+and it consumes SNAT ports, so it's off by default. `--tcp-state` limits the table
+to specific TCP states (e.g. `TIME_WAIT`, or `TIME_WAIT,CLOSE_WAIT`).
 
 On first run it checks for its tools and, if any are missing, **prompts you to
 `apt-get install` them immediately** before continuing.

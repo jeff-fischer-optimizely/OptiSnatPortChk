@@ -212,8 +212,9 @@ VERBOSE=0             # --verbose/-v: show per-poll diagnostics; default keeps j
 # diagnose. Passive SNI capture names almost everything without touching the
 # network, so probing is opt-in via --active.
 PROBE_ENABLED=0
-for arg in "$@"; do
-    case "$arg" in
+TCP_STATES=""         # --tcp-state: only show these state(s), e.g. TIME_WAIT (comma-separated ok)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --group-by-pid|--pid|-p) GROUP_BY_PID=1 ;;
         # Enable the active self-probe fallback (see PROBE_DELAY for the grace period).
         --active|-a)          PROBE_ENABLED=1 ;;
@@ -222,10 +223,26 @@ for arg in "$@"; do
         # Show the per-poll diagnostic chatter (collector heartbeat, probe status,
         # unresolved notes). Default keeps the output to just the table.
         --verbose|-v)         VERBOSE=1 ;;
+        # Only show connections in the given TCP state(s), e.g. --tcp-state TIME_WAIT
+        # or --tcp-state TIME_WAIT,CLOSE_WAIT. Case-insensitive.
+        --tcp-state|--tcp-states) shift; TCP_STATES="${1:-}" ;;
+        --tcp-state=*|--tcp-states=*) TCP_STATES="${1#*=}" ;;
     esac
+    shift
 done
 # No trigger tool means we can't self-probe -- don't pretend we can.
 [[ -z "$TRIGGER_TOOL" ]] && PROBE_ENABLED=0
+
+# Build the awk state filter. Default: the four states the original tracked.
+# A --tcp-state value is upper-cased and comma->'|' for use as an awk regex.
+if [[ -n "$TCP_STATES" ]]; then
+    STATE_REGEX="${TCP_STATES^^}"; STATE_REGEX="${STATE_REGEX// /}"; STATE_REGEX="${STATE_REGEX//,/|}"
+else
+    STATE_REGEX="ESTABLISHED|TIME_WAIT|CLOSE_WAIT|FIN_WAIT"
+fi
+
+# vlog: echo only in --verbose mode. Used to gate per-poll diagnostics.
+vlog() { [[ "$VERBOSE" -eq 1 ]] && printf '%s\n' "$*"; return 0; }
 
 # vlog: echo only in --verbose mode. Used to gate per-poll diagnostics.
 vlog() { [[ "$VERBOSE" -eq 1 ]] && printf '%s\n' "$*"; return 0; }
@@ -490,8 +507,8 @@ while true; do
 
     # --- Snapshot netstat into tab-separated rows: remote \t pid \t prog \t total \t states
     mapfile -t ROWS < <(
-        netstat -natp 2>/dev/null | awk -v group_by_pid="$GROUP_BY_PID" '
-        /ESTABLISHED|TIME_WAIT|CLOSE_WAIT|FIN_WAIT/ {
+        netstat -natp 2>/dev/null | awk -v group_by_pid="$GROUP_BY_PID" -v state_regex="$STATE_REGEX" '
+        $6 ~ state_regex {
             split($4, laddr, ":");
             localPort = (length(laddr) > 2 ? laddr[length(laddr)] : laddr[2]);
             foreignAddr = $5;
@@ -607,6 +624,7 @@ while true; do
     vlog ""
 
     # --- Render the enriched table: IP, DNS, and Service(Port) as columns.
+    [[ -n "$TCP_STATES" ]] && echo "Filtered to TCP state(s): ${STATE_REGEX//|/, }"
     printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "Remote IP" "DNS" "Service (Port)" "PID" "Process" "Total" "States (Count)"
     printf '%.0s-' {1..140}; echo
 
