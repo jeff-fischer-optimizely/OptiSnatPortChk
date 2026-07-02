@@ -70,7 +70,8 @@ exactly like the original — with these columns:
 
 | Column | Meaning |
 |---|---|
-| `Remote (DNS or IP):Port` | Hostname if resolved, otherwise the raw IP |
+| `Remote IP:Port` | The raw remote address and port |
+| `DNS` | Resolved hostname, or `-` if not yet known |
 | `Service` | Well-known service for the port (e.g. `HTTPS`, `AMQPS`, `MSSQL`, `Redis-TLS`), or `-` if unknown |
 | `PID` | Owning process id |
 | `Process` | Owning process name |

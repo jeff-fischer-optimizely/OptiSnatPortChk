@@ -597,9 +597,9 @@ while true; do
     echo "Resolution pass complete in ${resolve_elapsed}s."
     echo ""
 
-    # --- Render the enriched table (hostname substituted for IP where known).
-    printf "%-52s %-12s %-8s %-20s %-8s %s\n" "Remote (DNS or IP):Port" "Service" "PID" "Process" "Total" "States (Count)"
-    printf '%.0s-' {1..122}; echo
+    # --- Render the enriched table with IP and DNS as separate columns.
+    printf "%-23s %-46s %-11s %-7s %-18s %-7s %s\n" "Remote IP:Port" "DNS" "Service" "PID" "Process" "Total" "States (Count)"
+    printf '%.0s-' {1..140}; echo
 
     unresolved=0
     for row in "${ROWS[@]}"; do
@@ -607,16 +607,14 @@ while true; do
         ip="${remote%:*}"; port="${remote##*:}"
         svc="$(service_for_port "$port")"
         name="${NAME_CACHE[$ip]:-}"
-        if [[ -n "$name" ]]; then
-            display="${name}:${port}"
-        else
-            display="$remote"
+        if [[ -z "$name" ]]; then
+            name="-"
             unresolved=$((unresolved+1))
         fi
-        printf "%-52s %-12s %-8s %-20s %-8s %s\n" "$display" "$svc" "$pid" "$prog" "$total" "$states"
+        printf "%-23s %-46s %-11s %-7s %-18s %-7s %s\n" "$remote" "$name" "$svc" "$pid" "$prog" "$total" "$states"
     done
 
-    printf '%.0s-' {1..122}; echo
+    printf '%.0s-' {1..140}; echo
     if (( unresolved > 0 )); then
         echo "Note: ${unresolved} row(s) still show a raw IP -- the app hasn't opened a"
         echo "      NEW TLS connection to them since start (or they're non-TLS). Names"
