@@ -18,10 +18,10 @@ Default (passive resolution):
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 ```
 
-Group rows by PID (`-p` / `--group-by-pid`):
+Group rows by PID (`--pid`, alias of `-p` / `--group-by-pid`):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh -p
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid
 ```
 
 Also actively probe unseen IPs (`-a` / `--active`):
@@ -33,7 +33,7 @@ curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortCh
 Both flags together:
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh -p --active
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid --active
 ```
 
 See [Run](#run) below for what each flag does.
@@ -42,7 +42,7 @@ See [Run](#run) below for what each flag does.
 
 ```bash
 sudo ./snatportchk.sh              # sudo/root is required — tcpdump needs raw sockets
-sudo ./snatportchk.sh -p           # (or --group-by-pid) group rows by PID, like the original
+sudo ./snatportchk.sh --pid        # (alias: -p / --group-by-pid) group rows by PID, like the original
 sudo ./snatportchk.sh --active     # (or -a) also actively probe IPs the passive collector hasn't seen
 ```
 

@@ -173,7 +173,7 @@ GROUP_BY_PID=0
 ACTIVE_PROBE=0        # off by default: rely on the passive collector's app-SNI
 for arg in "$@"; do
     case "$arg" in
-        --group-by-pid|-p) GROUP_BY_PID=1 ;;
+        --group-by-pid|--pid|-p) GROUP_BY_PID=1 ;;
         # Opt-in active probing: open the connection ourselves to name IPs the
         # passive collector hasn't seen. We log our own session keys so tshark
         # can decrypt even a TLS 1.3 handshake and read the server certificate.
