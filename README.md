@@ -12,12 +12,31 @@ with the real `hostname:port` discovered by sniffing TLS handshakes locally.
 
 ## Install & run (one-liner)
 
+Default (passive resolution):
+
 ```bash
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 ```
 
-Add `--active` (or `-p`) to that trailing `sudo ./snatportchk.sh` as needed —
-see [Run](#run) below.
+Group rows by PID (`-p` / `--group-by-pid`):
+
+```bash
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh -p
+```
+
+Also actively probe unseen IPs (`-a` / `--active`):
+
+```bash
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active
+```
+
+Both flags together:
+
+```bash
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh -p --active
+```
+
+See [Run](#run) below for what each flag does.
 
 ## Run
 
