@@ -445,6 +445,10 @@ echo ""
 # in parallel with the polling loop below.
 start_collector
 echo "Background collector started (pid ${COLLECTOR_PID}); harvesting SNIs in parallel."
+# Brief warm-up so the very first poll already has passive mappings to merge
+# (the app opens new TLS connections continuously, so a moment is enough).
+echo "Warming up capture for ${COLLECTOR_WARMUP:-3}s..."
+sleep "${COLLECTOR_WARMUP:-3}"
 echo ""
 
 while true; do
