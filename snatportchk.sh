@@ -13,23 +13,27 @@
 # reverse DNS (which is almost never configured for these hosts). It does a
 # "local lookup" from live TLS traffic instead, via two mechanisms:
 #
-#   PASSIVE (default) -- an async background collector runs from startup:
-#        tcpdump -i any -nn -U -s0 -w -  'tcp port 443 or tcp port 80' \
+#   PASSIVE (primary) -- an async background collector runs from startup and
+#      captures TLS ClientHellos on ANY port (via a BPF match), then:
+#        tcpdump -i any -nn -U -s0 -w -  '<clienthello-bpf>' \
 #          | tshark -r - -T fields -e ip.dst -e tls.handshake.extensions_server_name
 #      It reads the CLIENT SNI out of the application's own ClientHello (cleartext
 #      in TLS 1.2 AND 1.3), giving the exact hostname the app requested.
 #
-#   ACTIVE (opt-in, --active) -- for IPs the collector hasn't seen (e.g. long-lived
-#      pre-existing connections), open a connection ourselves to force a handshake:
+#   ACTIVE (automatic fallback) -- if passive hasn't named an IP within PROBE_DELAY
+#      seconds, open a connection ourselves to force a handshake:
 #        tcpdump -i any -nn host <IP> and port <PORT> -s0 -w tracedump.pcap
 #      We log OUR OWN session keys (openssl -keylogfile / SSLKEYLOGFILE) so tshark
 #      can decrypt even a TLS 1.3 handshake and read the SERVER certificate SAN/CN:
 #        tshark -o tls.keylog_file:keys.log -r tracedump.pcap ...
 #      No SNI is sent (we don't know the name), so active names are APPROXIMATE.
+#      Disable with --passive; probe immediately with --active (PROBE_DELAY=0).
+#
+# Each row also shows a Service column derived from the well-known port number.
 #
 # Results are held in an IN-MEMORY cache (an associative array) so each IP is
 # only ever looked up once -- subsequent polls reuse the cached hostname. The
-# script reports lookup status and timing as it works, and (in active mode) runs
+# script reports lookup status and timing as it works, and self-probes run
 # tcpdump only as long as needed to obtain the name.
 #
 # Download & run (one-liner; tcpdump needs root/CAP_NET_RAW):
@@ -50,17 +54,44 @@ CAPTURE_IFACE="${CAPTURE_IFACE:-any}"     # tcpdump interface
 TRIGGER_TIMEOUT="${TRIGGER_TIMEOUT:-4}"   # max seconds to wait on our own handshake
 MAX_CAPTURE="${MAX_CAPTURE:-6}"           # hard cap on tcpdump duration per lookup
 NEG_RETRY_WINDOW="${NEG_RETRY_WINDOW:-300}" # don't re-attempt a failed IP for this long
+PROBE_DELAY="${PROBE_DELAY:-10}"          # give passive this many seconds before we self-probe an IP (0 = immediate)
 
 # ---------------------------------------------------------------------------
 # In-memory lookup tables (persist for the life of the script)
 # ---------------------------------------------------------------------------
 declare -A NAME_CACHE     # ip -> hostname  (positive results; never re-looked-up)
 declare -A LAST_TRY       # ip -> $SECONDS at last FAILED attempt (for retry backoff)
+declare -A FIRST_SEEN     # ip -> $SECONDS first observed unresolved (for probe grace period)
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/snatportchk.XXXXXX")"
 MAP_FILE="$WORKDIR/mappings.tsv"   # background collector appends "ip<TAB>hostname" here
 : > "$MAP_FILE"
 COLLECTOR_PID=""                   # pid of the async tcpdump|tshark collector
+
+# ---------------------------------------------------------------------------
+# Known-port -> service label, for the "Service" column. Focused on the kinds of
+# outbound dependencies these hosts have (web, messaging, databases, caches).
+# ---------------------------------------------------------------------------
+declare -A SERVICES=(
+    [20]=FTP-DATA [21]=FTP [22]=SSH [23]=Telnet [25]=SMTP [53]=DNS
+    [80]=HTTP [110]=POP3 [111]=RPC [123]=NTP [135]=MSRPC [143]=IMAP
+    [389]=LDAP [443]=HTTPS [445]=SMB [465]=SMTPS [587]=SMTP-SUB [636]=LDAPS
+    [853]=DNS-TLS [873]=rsync [989]=FTPS-DATA [990]=FTPS [993]=IMAPS [995]=POP3S
+    [1025]=Azure-AD [1433]=MSSQL [1434]=MSSQL-Mon [1521]=Oracle [1830]=Oracle
+    [2049]=NFS [2222]=SSH-Alt [2375]=Docker [2376]=Docker-TLS
+    [3306]=MySQL [3389]=RDP [4222]=NATS [4369]=EPMD
+    [5000]=HTTP-Alt [5432]=PostgreSQL [5671]=AMQPS [5672]=AMQP
+    [5900]=VNC [5985]=WinRM [5986]=WinRM-TLS
+    [6379]=Redis [6380]=Redis-TLS [8080]=HTTP-Alt [8443]=HTTPS-Alt
+    [9042]=Cassandra [9092]=Kafka [9093]=Kafka-TLS [9200]=Elasticsearch
+    [9300]=Elasticsearch [10250]=Kubelet [11211]=Memcached
+    [15672]=RabbitMQ-Mgmt [27017]=MongoDB [27018]=MongoDB [61616]=ActiveMQ
+)
+
+# service_for_port <port> -> label (or "-" if unknown)
+service_for_port() {
+    printf '%s' "${SERVICES[$1]:--}"
+}
 
 # ---------------------------------------------------------------------------
 # Root / sudo handling (tcpdump needs raw-socket privileges)
@@ -174,15 +205,14 @@ echo ""
 # Argument parsing (kept from the original)
 # ---------------------------------------------------------------------------
 GROUP_BY_PID=0
-ACTIVE_PROBE=0        # off by default: rely on the passive collector's app-SNI
+PROBE_ENABLED=1       # auto-probe an IP ourselves once passive has had PROBE_DELAY to name it
 for arg in "$@"; do
     case "$arg" in
         --group-by-pid|--pid|-p) GROUP_BY_PID=1 ;;
-        # Opt-in active probing: open the connection ourselves to name IPs the
-        # passive collector hasn't seen. We log our own session keys so tshark
-        # can decrypt even a TLS 1.3 handshake and read the server certificate.
-        # Approximate (no SNI sent) -- see the note printed at startup.
-        --active|-a)       ACTIVE_PROBE=1 ;;
+        # Probe immediately instead of waiting out the grace period.
+        --active|-a)          PROBE_DELAY=0 ;;
+        # Disable self-probing entirely: passive collector only.
+        --passive|--no-probe) PROBE_ENABLED=0 ;;
     esac
 done
 
@@ -194,7 +224,8 @@ done
 #   -keylogfile / SSLKEYLOGFILE). tshark can then decrypt the handshake -- even
 #   TLS 1.3, where the certificate is encrypted -- and read the cert SAN/CN.
 #   If key logging isn't available, we instead cap at TLS 1.2, where the
-#   certificate is already cleartext. Only reached when --active is set.
+#   certificate is already cleartext. Only reached when self-probing is enabled
+#   (i.e. not --passive) and an IP has gone unresolved past PROBE_DELAY.
 # ---------------------------------------------------------------------------
 trigger_handshake() {
     local ip="$1" port="$2" keylog="$3"
@@ -267,11 +298,19 @@ extract_name() {
     printf '%s' "$name"
 }
 
+# BPF that matches a TLS ClientHello on ANY tcp port: the byte at the start of
+# the TCP payload is the TLS record content-type (22 = handshake) and the byte
+# 5 further in is the handshake type (1 = ClientHello). '(tcp[12]&0xf0)>>2' is
+# the TCP header length, so this works regardless of TCP options. Capturing only
+# ClientHellos keeps the volume through the pipe tiny even on a busy host.
+# (IPv4 offsets; IPv6-only endpoints may be missed -- rare for these hosts.)
+CLIENTHELLO_BPF='tcp[((tcp[12]&0xf0)>>2)]=22 and tcp[((tcp[12]&0xf0)>>2)+5]=1'
+
 # ---------------------------------------------------------------------------
 # start_collector
 #   Launch the ASYNC background collector: tcpdump streams the live capture
 #   straight into tshark (tcpdump writes, tshark reads -- via a pipe), which
-#   emits "ip.dst<TAB>hostname" for every TLS ClientHello it sees on 80/443.
+#   emits "ip.dst<TAB>hostname" for every TLS ClientHello it sees on ANY port.
 #   Each observed mapping is appended to $MAP_FILE. This runs in parallel from
 #   startup, so the application's own handshakes are harvested immediately and
 #   the main loop rarely has to block on an on-demand lookup.
@@ -279,7 +318,7 @@ extract_name() {
 start_collector() {
     (
         $SUDO tcpdump -i "$CAPTURE_IFACE" -nn -U -s0 -w - \
-            'tcp port 443 or tcp port 80' 2>/dev/null \
+            "$CLIENTHELLO_BPF" 2>/dev/null \
         | tshark -r - -l -Q \
             -Y 'tls.handshake.extensions_server_name' \
             -T fields -e ip.dst -e ipv6.dst \
@@ -328,14 +367,22 @@ lookup_ip() {
         return 0
     fi
 
-    # 2) Passive-only mode (default): no active probe. The IP stays unresolved
-    #    until the background collector sees the app's own handshake for it.
-    if [[ "$ACTIVE_PROBE" -ne 1 ]]; then
+    # 2) Self-probing disabled (--passive): stay hands-off; the IP resolves only
+    #    if/when the background collector sees the app's own handshake for it.
+    if [[ "$PROBE_ENABLED" -ne 1 ]]; then
         printf ''
         return 0
     fi
 
-    # 3) Recent failure -- back off instead of hammering the same dead IP.
+    # 3) Grace period: give the passive collector PROBE_DELAY seconds to name the
+    #    IP on its own (a natural handshake) before we open a connection ourselves.
+    [[ -z "${FIRST_SEEN[$ip]+x}" ]] && FIRST_SEEN[$ip]=$SECONDS
+    if (( SECONDS - FIRST_SEEN[$ip] < PROBE_DELAY )); then
+        printf ''
+        return 0
+    fi
+
+    # 4) Recent failure -- back off instead of hammering the same dead IP.
     if [[ -n "${LAST_TRY[$ip]+x}" ]]; then
         local age=$(( SECONDS - LAST_TRY[$ip] ))
         if (( age < NEG_RETRY_WINDOW )); then
@@ -344,7 +391,7 @@ lookup_ip() {
         fi
     fi
 
-    # 4) Active probe (--active): run tcpdump only as long as necessary.
+    # 5) Active probe: run tcpdump only as long as necessary.
     local pcap="$WORKDIR/lookup.pcap" keylog="$WORKDIR/lookup.keys" start elapsed name
     start=$SECONDS
     printf '  [lookup] %-21s capturing handshake (port %s)...\n' "$ip" "$port" >&2
@@ -407,20 +454,24 @@ echo "  * Reverse DNS is NOT used; hostnames come from live TLS handshakes."
 echo "  * Each remote IP is resolved once via tcpdump+tshark, then cached in memory."
 echo "  * tcpdump requires root; running via: ${SUDO:-<already root>}"
 echo "  * Press 'q' or Ctrl-C at any time to stop cleanly."
-if [[ "$ACTIVE_PROBE" -eq 1 ]]; then
-    echo "  * ACTIVE probing ENABLED (--active): unseen IPs are probed by opening a"
-    echo "    connection and reading the server cert. Names so obtained are"
-    echo "    APPROXIMATE (no SNI sent)."
-    if [[ "$KEYLOG_OK" -eq 1 ]]; then
-        echo "    TLS 1.3 supported: our own session keys are logged so tshark can"
-        echo "    decrypt the handshake and read the certificate."
+if [[ "$PROBE_ENABLED" -eq 1 ]]; then
+    if (( PROBE_DELAY > 0 )); then
+        echo "  * Passive first: an IP is named from the app's own handshake if seen"
+        echo "    within ${PROBE_DELAY}s; otherwise we self-probe it (open a connection,"
+        echo "    read the server cert -- APPROXIMATE, no SNI sent)."
     else
-        echo "    Key logging unavailable (need openssl 3.0+ or curl); falling back"
-        echo "    to forcing TLS 1.2, so TLS 1.3-only servers won't resolve."
+        echo "  * Self-probe immediately (PROBE_DELAY=0): unseen IPs are probed at once"
+        echo "    by opening a connection and reading the server cert (APPROXIMATE)."
+    fi
+    if [[ "$KEYLOG_OK" -eq 1 ]]; then
+        echo "    TLS 1.3 probes: our own session keys are logged so tshark can decrypt."
+    else
+        echo "    Key logging unavailable (need openssl 3.0+ or curl); probes force"
+        echo "    TLS 1.2, so TLS 1.3-only servers won't resolve via probing."
     fi
 else
-    echo "  * Passive mode: names come only from the app's own handshakes."
-    echo "    Re-run with --active to also probe IPs the collector hasn't seen."
+    echo "  * Passive only (--passive): names come solely from the app's own"
+    echo "    handshakes; no self-probing."
 fi
 echo ""
 
@@ -518,13 +569,14 @@ while true; do
     echo ""
 
     # --- Render the enriched table (hostname substituted for IP where known).
-    printf "%-52s %-8s %-20s %-8s %s\n" "Remote (DNS or IP):Port" "PID" "Process" "Total" "States (Count)"
-    printf '%.0s-' {1..110}; echo
+    printf "%-52s %-12s %-8s %-20s %-8s %s\n" "Remote (DNS or IP):Port" "Service" "PID" "Process" "Total" "States (Count)"
+    printf '%.0s-' {1..122}; echo
 
     unresolved=0
     for row in "${ROWS[@]}"; do
         IFS=$'\t' read -r remote pid prog total states <<< "$row"
         ip="${remote%:*}"; port="${remote##*:}"
+        svc="$(service_for_port "$port")"
         name="${NAME_CACHE[$ip]:-}"
         if [[ -n "$name" ]]; then
             display="${name}:${port}"
@@ -532,10 +584,10 @@ while true; do
             display="$remote"
             unresolved=$((unresolved+1))
         fi
-        printf "%-52s %-8s %-20s %-8s %s\n" "$display" "$pid" "$prog" "$total" "$states"
+        printf "%-52s %-12s %-8s %-20s %-8s %s\n" "$display" "$svc" "$pid" "$prog" "$total" "$states"
     done
 
-    printf '%.0s-' {1..110}; echo
+    printf '%.0s-' {1..122}; echo
     if (( unresolved > 0 )); then
         echo "Note: ${unresolved} row(s) still show a raw IP -- no TLS name was obtained"
         echo "      (non-TLS port, handshake not captured, or server sent no usable cert)."

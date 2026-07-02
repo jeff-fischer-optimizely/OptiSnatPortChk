@@ -12,7 +12,7 @@ with the real `hostname:port` discovered by sniffing TLS handshakes locally.
 
 ## Install & run (one-liner)
 
-Default (passive resolution):
+Default (passive first, auto-probe after a 10s grace period):
 
 ```bash
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
@@ -24,16 +24,16 @@ Group rows by PID (`--pid`, alias of `-p` / `--group-by-pid`):
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid
 ```
 
-Also actively probe unseen IPs (`-a` / `--active`):
+Probe immediately, no grace period (`-a` / `--active`):
 
 ```bash
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active
 ```
 
-Both flags together:
+Passive only, never self-probe (`--passive` / `--no-probe`):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid --active
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --passive
 ```
 
 See [Run](#run) below for what each flag does.
@@ -43,16 +43,19 @@ See [Run](#run) below for what each flag does.
 ```bash
 sudo ./snatportchk.sh              # sudo/root is required — tcpdump needs raw sockets
 sudo ./snatportchk.sh --pid        # (alias: -p / --group-by-pid) group rows by PID, like the original
-sudo ./snatportchk.sh --active     # (or -a) also actively probe IPs the passive collector hasn't seen
+sudo ./snatportchk.sh --active     # (or -a) self-probe immediately (PROBE_DELAY=0), no grace period
+sudo ./snatportchk.sh --passive    # (or --no-probe) never self-probe; passive collector only
 ```
 
 **To stop:** press **`q`** (or **Ctrl-C**) — either one shuts down the background
 capture, stops tshark/tcpdump, and removes the temp files cleanly.
 
-By default the script is **passive**: hostnames come only from the applications'
-own TLS handshakes (reliable and accurate). Add `--active` if some IPs stay
-unresolved and you want the script to probe them itself — see
-**"2. Active on-demand lookup"** below for the trade-offs.
+By default the script is **passive first**: an IP is named from the application's
+own TLS handshake if one is seen within `PROBE_DELAY` seconds (default 10). If it
+stays unresolved past that window, the script **self-probes** it — opens a
+connection and reads the server certificate. Passive names are exact (real SNI);
+probe names are approximate (no SNI sent). Use `--active` to probe immediately or
+`--passive` to disable probing entirely.
 
 On first run it checks for its tools and, if any are missing, **prompts you to
 `apt-get install` them immediately** before continuing.
@@ -68,6 +71,7 @@ exactly like the original — with these columns:
 | Column | Meaning |
 |---|---|
 | `Remote (DNS or IP):Port` | Hostname if resolved, otherwise the raw IP |
+| `Service` | Well-known service for the port (e.g. `HTTPS`, `AMQPS`, `MSSQL`, `Redis-TLS`), or `-` if unknown |
 | `PID` | Owning process id |
 | `Process` | Owning process name |
 | `Total` | Number of matching sockets |
@@ -89,25 +93,29 @@ At launch — before the first poll — a background collector starts so handsha
 are captured from `t=0`:
 
 ```bash
-tcpdump -i any -nn -U -s0 -w -  'tcp port 443 or tcp port 80' \
+# BPF below matches a TLS ClientHello on ANY tcp port (record type 22 + handshake type 1)
+tcpdump -i any -nn -U -s0 -w -  'tcp[((tcp[12]&0xf0)>>2)]=22 and tcp[((tcp[12]&0xf0)>>2)+5]=1' \
   | tshark -r - -l -Q \
       -Y 'tls.handshake.extensions_server_name' \
       -T fields -e ip.dst -e ipv6.dst -e tls.handshake.extensions_server_name
 ```
 
 `tcpdump` streams the live capture straight into `tshark` (tcpdump writes,
-tshark reads — via a pipe). For every TLS **ClientHello**, `tshark` emits the
-destination IP and the **SNI** (`tls.handshake.extensions_server_name`) — i.e.
-the exact hostname the local application asked for. Each `ip → hostname` pair is
-appended to an in-memory-backed mappings file, which the main loop folds into the
-cache on every poll. Because it runs in parallel, the application's own
-connections are resolved with zero added latency.
+tshark reads — via a pipe). Rather than a fixed port list, a BPF filter matches
+**TLS ClientHello packets on any port**, so HTTPS (443), AMQPS (5671), and other
+TLS services are all covered while the volume through the pipe stays tiny. For
+every ClientHello, `tshark` emits the destination IP and the **SNI**
+(`tls.handshake.extensions_server_name`) — the exact hostname the local
+application asked for. Each `ip → hostname` pair is appended to a mappings file
+that the main loop folds into the cache on every poll. Because it runs in
+parallel, the application's own connections are resolved with zero added latency.
 
-### 2. Active on-demand lookup (opt-in — `--active`)
+### 2. Active self-probe (automatic fallback after `PROBE_DELAY`)
 
 Long-lived or pre-existing connections never send a *fresh* ClientHello, so the
-passive collector can't see them. **Only when you pass `--active`**, the script
-probes any such IP with a targeted, minimal-duration lookup:
+passive collector can't see them. If an IP stays unresolved for `PROBE_DELAY`
+seconds (default 10; `0` = immediate via `--active`; disabled by `--passive`),
+the script probes it with a targeted, minimal-duration lookup:
 
 ```bash
 tcpdump -i any -nn host <IP> and port <PORT> -s0 -w tracedump.pcap        # capture just this host
@@ -144,9 +152,9 @@ necessary.
 
 > **Passive vs. active, in one line:** the passive collector reads the *client's*
 > SNI (cleartext in TLS 1.2 **and** 1.3, and it's the exact name the app used);
-> the active probe reads the *server's* certificate (TLS 1.2 only, and possibly a
-> default cert). Passive is the reliable engine; active is a fallback you switch
-> on when passive leaves gaps.
+> the active probe reads the *server's* certificate (decrypting TLS 1.3 with its
+> own logged keys, possibly a default cert). Passive is the reliable engine;
+> active is the automatic fallback once an IP outlives the grace period.
 
 ### 3. In-memory cache (resolve each IP once)
 
@@ -167,6 +175,9 @@ Resolving 6 unique remote host(s): 4 from cache, 2 new lookup(s).
 Resolution pass complete in 2s.
 ```
 
+An IP is only self-probed after it has gone unresolved for `PROBE_DELAY` seconds,
+giving the (accurate) passive collector first crack at it.
+
 ---
 
 ## Requirements & install prompt
@@ -176,7 +187,7 @@ Resolution pass complete in 2s.
 | `netstat` | `net-tools` | connection polling | yes |
 | `tcpdump` | `tcpdump` | packet capture (needs root) | yes |
 | `tshark` | `tshark` | SNI / certificate extraction | yes |
-| `openssl` | `openssl` | triggers the handshake for `--active` lookups (3.0+ logs keys to decrypt TLS 1.3; older falls back to TLS 1.2) | soft (falls back to `curl`, then to passive-only) |
+| `openssl` | `openssl` | triggers the handshake for self-probes (3.0+ logs keys to decrypt TLS 1.3; older falls back to TLS 1.2) | soft (falls back to `curl`, then to passive-only) |
 
 Missing **required** tools trigger an interactive `apt-get install` prompt at
 startup (apt only — matching the original script). On non-apt systems you're told
@@ -193,6 +204,7 @@ If you're not root, it automatically prefixes capture commands with `sudo`.
 |---|---|---|
 | `POLL_INTERVAL` | `10` | Seconds between netstat polls |
 | `CAPTURE_IFACE` | `any` | Interface passed to `tcpdump -i` |
+| `PROBE_DELAY` | `10` | Seconds an IP may stay unresolved before self-probing (`0` = immediate, same as `--active`) |
 | `TRIGGER_TIMEOUT` | `4` | Max seconds to wait on our own handshake (active lookup) |
 | `MAX_CAPTURE` | `6` | Hard cap on tcpdump duration per active lookup |
 | `NEG_RETRY_WINDOW` | `300` | Seconds before a failed IP is retried |
@@ -207,10 +219,15 @@ sudo POLL_INTERVAL=5 CAPTURE_IFACE=eth0 ./snatportchk.sh
 
 ## Limitations
 
-- **Non-TLS traffic can't be named this way.** Plain HTTP (port 80) exposes no
-  SNI, and a hostname can only be learned from the server certificate on TLS
-  ports. Such rows keep the raw IP.
-- **TLS 1.3 encrypts the server certificate.** The active probe handles this by
+- **Non-TLS traffic can't be named this way.** A hostname is only learnable from a
+  TLS handshake (client SNI or server cert). Ports that don't do a readable TLS
+  handshake — plain HTTP (80), and often SQL Server (1433, TLS is wrapped inside
+  TDS) — keep the raw IP, but the **Service** column still labels them.
+- **Capture is now all-port** (a BPF match on the TLS ClientHello), so TLS
+  services on non-standard ports — e.g. AMQPS (5671) — resolve passively too, not
+  just 443. Volume through the pipe stays small because only ClientHellos match.
+  IPv6-only endpoints may be missed (the BPF uses IPv4 offsets).
+- **TLS 1.3 encrypts the server certificate.** The self-probe handles this by
   logging its *own* session keys and decrypting with tshark — but only if the
   trigger tool supports key logging (openssl 3.0+ or curl). Without it, the probe
   falls back to forcing TLS 1.2 and can't name TLS 1.3-only servers. (The
@@ -219,9 +236,10 @@ sudo POLL_INTERVAL=5 CAPTURE_IFACE=eth0 ./snatportchk.sh
 - **CDN / shared IPs** may present a wildcard or a different-but-valid cert name
   (e.g. `*.cdn.example.net`) than the app requested. Passive SNI (when available)
   is preferred precisely because it reflects what the app actually asked for; the
-  active probe's cert-derived names are approximate.
-- **The active lookup (`--active`) opens a real connection** to the remote IP (and
-  closes it immediately). That is by design, to force a handshake without waiting.
+  self-probe's cert-derived names are approximate.
+- **Self-probing opens a real connection** to the remote IP (and closes it
+  immediately) once an IP outlives `PROBE_DELAY`. That is by design; use
+  `--passive` to disable it entirely.
 - **Live `tcpdump | tshark` pipe:** streams on mainstream builds; if a particular
-  `tshark` buffers until EOF, the passive collector may lag — running with
-  `--active` still covers those IPs.
+  `tshark` buffers until EOF, the passive collector may lag — self-probing still
+  covers those IPs after the grace period.
