@@ -18,7 +18,13 @@ Default (passive — names come from the app's own TLS handshakes):
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
 ```
 
-**Only `TIME_WAIT` connections, with active probing** (the SNAT-port-pressure view):
+Probe immediately, no grace period (`-a` / `--active`):
+
+```bash
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active
+```
+
+**Only `TIME_WAIT`** connections, with active probing (the SNAT-port-pressure view):
 
 ```bash
 curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active --tcp-state TIME_WAIT
