@@ -66,8 +66,9 @@ declare -A FIRST_SEEN     # ip -> $SECONDS first observed unresolved (for probe 
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/snatportchk.XXXXXX")"
 MAP_FILE="$WORKDIR/mappings.tsv"   # background collector appends "ip<TAB>hostname" here
+COLLECTOR_ERR="$WORKDIR/collector.err"  # collector's stderr (for diagnosing a silent capture)
 : > "$MAP_FILE"
-COLLECTOR_PID=""                   # pid of the async tcpdump|tshark collector
+COLLECTOR_PID=""                   # pid of the async tshark collector
 
 # ---------------------------------------------------------------------------
 # Known-port -> service label, for the "Service" column. Focused on the kinds of
@@ -316,10 +317,10 @@ COLLECTOR_CAPFILTER="${COLLECTOR_CAPFILTER:-tcp}"
 # ---------------------------------------------------------------------------
 start_collector() {
     (
-        $SUDO tshark -i "$CAPTURE_IFACE" -l -Q -f "$COLLECTOR_CAPFILTER" \
+        $SUDO tshark -i "$CAPTURE_IFACE" -l -f "$COLLECTOR_CAPFILTER" \
             -Y 'tls.handshake.extensions_server_name' \
             -T fields -e ip.dst -e ipv6.dst \
-            -e tls.handshake.extensions_server_name 2>/dev/null \
+            -e tls.handshake.extensions_server_name 2>>"$COLLECTOR_ERR" \
         | while IFS=$'\t' read -r ip4 ip6 sni; do
               ip="${ip4:-$ip6}"
               sni="${sni%%,*}"
@@ -456,11 +457,19 @@ while true; do
     # If this stays at 0 while the app is clearly making TLS connections, the
     # live capture isn't working (permissions / interface / filter) rather than
     # "no new handshakes yet".
-    obs=$(wc -l < "$MAP_FILE" 2>/dev/null); obs=${obs//[^0-9]/}
+    obs=$(wc -l < "$MAP_FILE" 2>/dev/null); obs=${obs//[^0-9]/}; obs=${obs:-0}
     if ! kill -0 "$COLLECTOR_PID" 2>/dev/null; then
-        echo "  [async] WARNING: background collector is not running (it exited)."
+        echo "  [async] WARNING: background collector is NOT running (it exited). Last stderr:"
+        tail -n 3 "$COLLECTOR_ERR" 2>/dev/null | sed 's/^/            /'
+    elif (( obs == 0 )); then
+        echo "  [async] collector running, 0 handshakes captured yet (fine if the app"
+        echo "          hasn't opened a NEW TLS connection since start)."
+        if [[ -s "$COLLECTOR_ERR" ]]; then
+            echo "          collector stderr so far:"
+            tail -n 3 "$COLLECTOR_ERR" 2>/dev/null | sed 's/^/            /'
+        fi
     else
-        echo "  [async] collector has captured ${obs:-0} TLS handshake(s) so far."
+        echo "  [async] collector has captured ${obs} TLS handshake(s) so far."
     fi
 
     # --- Snapshot netstat into tab-separated rows: remote \t pid \t prog \t total \t states
