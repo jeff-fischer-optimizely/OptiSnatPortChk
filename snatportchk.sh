@@ -597,8 +597,8 @@ while true; do
     echo "Resolution pass complete in ${resolve_elapsed}s."
     echo ""
 
-    # --- Render the enriched table with IP and DNS as separate columns.
-    printf "%-23s %-46s %-11s %-7s %-18s %-7s %s\n" "Remote IP:Port" "DNS" "Service" "PID" "Process" "Total" "States (Count)"
+    # --- Render the enriched table: IP, DNS, and Service(Port) as columns.
+    printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "Remote IP" "DNS" "Service (Port)" "PID" "Process" "Total" "States (Count)"
     printf '%.0s-' {1..140}; echo
 
     unresolved=0
@@ -606,12 +606,17 @@ while true; do
         IFS=$'\t' read -r remote pid prog total states <<< "$row"
         ip="${remote%:*}"; port="${remote##*:}"
         svc="$(service_for_port "$port")"
+        if [[ "$svc" == "-" ]]; then
+            svc="(${port})"
+        else
+            svc="${svc} (${port})"
+        fi
         name="${NAME_CACHE[$ip]:-}"
         if [[ -z "$name" ]]; then
             name="-"
             unresolved=$((unresolved+1))
         fi
-        printf "%-23s %-46s %-11s %-7s %-18s %-7s %s\n" "$remote" "$name" "$svc" "$pid" "$prog" "$total" "$states"
+        printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "$ip" "$name" "$svc" "$pid" "$prog" "$total" "$states"
     done
 
     printf '%.0s-' {1..140}; echo
