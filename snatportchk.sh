@@ -55,6 +55,7 @@ TRIGGER_TIMEOUT="${TRIGGER_TIMEOUT:-4}"   # max seconds to wait on our own hands
 MAX_CAPTURE="${MAX_CAPTURE:-6}"           # hard cap on tcpdump duration per lookup
 NEG_RETRY_WINDOW="${NEG_RETRY_WINDOW:-300}" # don't re-attempt a failed IP for this long
 PROBE_DELAY="${PROBE_DELAY:-10}"          # give passive this many seconds before we self-probe an IP (0 = immediate)
+MAX_PARALLEL="${MAX_PARALLEL:-16}"        # max concurrent self-probes (bounds outbound connections we open at once)
 
 # ---------------------------------------------------------------------------
 # In-memory lookup tables (persist for the life of the script)
@@ -109,16 +110,12 @@ cleanup() {
     # 1) Reap the collector subshell wrapper.
     [[ -n "$COLLECTOR_PID" ]] && kill "$COLLECTOR_PID" 2>/dev/null
 
-    # 2) Kill OUR tcpdump captures (root-owned, hence $SUDO). Patterns are scoped
-    #    to this script's captures: the collector writes to stdout ('-w -'); each
-    #    active lookup writes into $WORKDIR. Once tcpdump dies, the pipe closes and
-    #    the collector's tshark ('-r -') and while-loop exit on EOF by themselves.
-    $SUDO pkill -f "tcpdump .*-w -"          2>/dev/null   # background collector
-    $SUDO pkill -f "tcpdump .*-w ${WORKDIR}" 2>/dev/null   # active per-IP lookups
-
-    # 3) Belt-and-suspenders: if tcpdump was already gone, make sure the
-    #    collector's tshark (same user, no sudo needed) isn't left blocked.
-    pkill -f "tshark -r -" 2>/dev/null
+    # 2) Kill OUR captures (root-owned, hence $SUDO).
+    #    - the background collector is 'tshark -i <iface>' (which spawns dumpcap)
+    #    - each active lookup is a 'tcpdump ... -w $WORKDIR/...'
+    $SUDO pkill -f "tshark -i ${CAPTURE_IFACE} .*${COLLECTOR_CAPFILTER}" 2>/dev/null
+    $SUDO pkill -f "dumpcap -i ${CAPTURE_IFACE}"        2>/dev/null   # tshark's capture child
+    $SUDO pkill -f "tcpdump .*-w ${WORKDIR}"            2>/dev/null   # active per-IP lookups
 
     rm -rf "$WORKDIR" 2>/dev/null
 }
@@ -195,8 +192,10 @@ else
     require_cmd openssl openssl soft && TRIGGER_TOOL="openssl"
 fi
 if [[ -z "$TRIGGER_TOOL" ]]; then
-    echo "  Note: neither openssl nor curl is available; lookups will rely on"
-    echo "        passively catching the application's own handshakes."
+    echo "  Note: neither openssl nor curl is available; self-probing is disabled,"
+    echo "        so names will come ONLY from passively-captured app handshakes."
+else
+    echo "  Self-probe tool: ${TRIGGER_TOOL} (TLS 1.3 key-log decrypt: $([[ $KEYLOG_OK -eq 1 ]] && echo yes || echo no))."
 fi
 echo "Tool check complete."
 echo ""
@@ -215,6 +214,8 @@ for arg in "$@"; do
         --passive|--no-probe) PROBE_ENABLED=0 ;;
     esac
 done
+# No trigger tool means we can't self-probe -- don't pretend we can.
+[[ -z "$TRIGGER_TOOL" ]] && PROBE_ENABLED=0
 
 # ---------------------------------------------------------------------------
 # trigger_handshake <ip> <port> <keylog>
@@ -298,28 +299,24 @@ extract_name() {
     printf '%s' "$name"
 }
 
-# BPF that matches a TLS ClientHello on ANY tcp port: the byte at the start of
-# the TCP payload is the TLS record content-type (22 = handshake) and the byte
-# 5 further in is the handshake type (1 = ClientHello). '(tcp[12]&0xf0)>>2' is
-# the TCP header length, so this works regardless of TCP options. Capturing only
-# ClientHellos keeps the volume through the pipe tiny even on a busy host.
-# (IPv4 offsets; IPv6-only endpoints may be missed -- rare for these hosts.)
-CLIENTHELLO_BPF='tcp[((tcp[12]&0xf0)>>2)]=22 and tcp[((tcp[12]&0xf0)>>2)+5]=1'
+# Capture filter for the collector. Default 'tcp' is deliberately broad and
+# robust -- we let tshark's TLS dissector pick out ClientHellos rather than a
+# fragile byte-offset BPF (which can silently match nothing on 'any'/cooked
+# captures). On a very busy host, narrow it, e.g.
+#   COLLECTOR_CAPFILTER='tcp port 443 or tcp port 5671'
+COLLECTOR_CAPFILTER="${COLLECTOR_CAPFILTER:-tcp}"
 
 # ---------------------------------------------------------------------------
 # start_collector
-#   Launch the ASYNC background collector: tcpdump streams the live capture
-#   straight into tshark (tcpdump writes, tshark reads -- via a pipe), which
-#   emits "ip.dst<TAB>hostname" for every TLS ClientHello it sees on ANY port.
-#   Each observed mapping is appended to $MAP_FILE. This runs in parallel from
-#   startup, so the application's own handshakes are harvested immediately and
-#   the main loop rarely has to block on an on-demand lookup.
+#   Launch the ASYNC background collector: tshark captures live on the wire and
+#   emits "ip.dst<TAB>SNI" for every TLS ClientHello (any port). tshark does the
+#   capture itself (no tcpdump|tshark pipe -- that pipe could buffer until EOF on
+#   some builds and emit nothing). Each mapping is appended to $MAP_FILE. Runs in
+#   parallel from startup so the app's own handshakes are harvested immediately.
 # ---------------------------------------------------------------------------
 start_collector() {
     (
-        $SUDO tcpdump -i "$CAPTURE_IFACE" -nn -U -s0 -w - \
-            "$CLIENTHELLO_BPF" 2>/dev/null \
-        | tshark -r - -l -Q \
+        $SUDO tshark -i "$CAPTURE_IFACE" -l -Q -f "$COLLECTOR_CAPFILTER" \
             -Y 'tls.handshake.extensions_server_name' \
             -T fields -e ip.dst -e ipv6.dst \
             -e tls.handshake.extensions_server_name 2>/dev/null \
@@ -353,53 +350,24 @@ merge_collector() {
 }
 
 # ---------------------------------------------------------------------------
-# lookup_ip <ip> <port>
-#   Returns the hostname on stdout (empty if unresolved). Uses/updates the
-#   in-memory cache and prints status + timing to stderr so it doesn't pollute
-#   the returned value.
+# probe_ip <ip> <port> <resultfile>
+#   PARALLEL-SAFE worker. Captures + triggers + extracts for ONE ip and writes
+#   the discovered hostname (empty if none) to <resultfile>. Runs in a background
+#   subshell, so it touches NO shared shell state -- the parent merges results
+#   afterward. Uses per-ip temp files so concurrent probes never collide.
+#   Runs tcpdump only as long as necessary to obtain the name.
 # ---------------------------------------------------------------------------
-lookup_ip() {
-    local ip="$1" port="$2"
-
-    # 1) Positive cache hit -- never look up twice.
-    if [[ -n "${NAME_CACHE[$ip]+x}" ]]; then
-        printf '%s' "${NAME_CACHE[$ip]}"
-        return 0
-    fi
-
-    # 2) Self-probing disabled (--passive): stay hands-off; the IP resolves only
-    #    if/when the background collector sees the app's own handshake for it.
-    if [[ "$PROBE_ENABLED" -ne 1 ]]; then
-        printf ''
-        return 0
-    fi
-
-    # 3) Grace period: give the passive collector PROBE_DELAY seconds to name the
-    #    IP on its own (a natural handshake) before we open a connection ourselves.
-    [[ -z "${FIRST_SEEN[$ip]+x}" ]] && FIRST_SEEN[$ip]=$SECONDS
-    if (( SECONDS - FIRST_SEEN[$ip] < PROBE_DELAY )); then
-        printf ''
-        return 0
-    fi
-
-    # 4) Recent failure -- back off instead of hammering the same dead IP.
-    if [[ -n "${LAST_TRY[$ip]+x}" ]]; then
-        local age=$(( SECONDS - LAST_TRY[$ip] ))
-        if (( age < NEG_RETRY_WINDOW )); then
-            printf ''
-            return 0
-        fi
-    fi
-
-    # 5) Active probe: run tcpdump only as long as necessary.
-    local pcap="$WORKDIR/lookup.pcap" keylog="$WORKDIR/lookup.keys" start elapsed name
+probe_ip() {
+    local ip="$1" port="$2" resultfile="$3"
+    local key="${ip//[.:]/_}"
+    local pcap="$WORKDIR/probe_${key}.pcap" keylog="$WORKDIR/probe_${key}.keys"
+    local start elapsed name cap_pid
     start=$SECONDS
-    printf '  [lookup] %-21s capturing handshake (port %s)...\n' "$ip" "$port" >&2
 
     rm -f "$pcap"; : > "$keylog"
     $SUDO timeout "$MAX_CAPTURE" tcpdump -i "$CAPTURE_IFACE" -nn \
         "host $ip and port $port" -s0 -w "$pcap" >/dev/null 2>&1 &
-    local cap_pid=$!
+    cap_pid=$!
 
     sleep 0.3                     # let tcpdump bind before we generate traffic
     trigger_handshake "$ip" "$port" "$keylog"   # logs our own session keys
@@ -415,16 +383,13 @@ lookup_ip() {
     [[ -s "$pcap" ]] && name="$(extract_name "$pcap" "$keylog")"
     elapsed=$(( SECONDS - start ))
 
+    printf '%s' "$name" > "$resultfile"
     if [[ -n "$name" ]]; then
-        NAME_CACHE[$ip]="$name"
-        unset 'LAST_TRY[$ip]'
-        printf '  [lookup] %-21s -> %s  (%ss)\n' "$ip" "$name" "$elapsed" >&2
-        printf '%s' "$name"
+        printf '  [probe] %-21s -> %s  (%ss)\n' "$ip" "$name" "$elapsed" >&2
     else
-        LAST_TRY[$ip]=$SECONDS
-        printf '  [lookup] %-21s -> (no DNS found)  (%ss)\n' "$ip" "$elapsed" >&2
-        printf ''
+        printf '  [probe] %-21s -> (no DNS found)  (%ss)\n' "$ip" "$elapsed" >&2
     fi
+    rm -f "$pcap" "$keylog"
 }
 
 # ---------------------------------------------------------------------------
@@ -487,6 +452,16 @@ while true; do
 
     # Fold anything the async collector has already discovered into the cache.
     merge_collector
+    # Heartbeat: how many handshakes the passive collector has captured so far.
+    # If this stays at 0 while the app is clearly making TLS connections, the
+    # live capture isn't working (permissions / interface / filter) rather than
+    # "no new handshakes yet".
+    obs=$(wc -l < "$MAP_FILE" 2>/dev/null); obs=${obs//[^0-9]/}
+    if ! kill -0 "$COLLECTOR_PID" 2>/dev/null; then
+        echo "  [async] WARNING: background collector is not running (it exited)."
+    else
+        echo "  [async] collector has captured ${obs:-0} TLS handshake(s) so far."
+    fi
 
     # --- Snapshot netstat into tab-separated rows: remote \t pid \t prog \t total \t states
     mapfile -t ROWS < <(
@@ -552,18 +527,56 @@ while true; do
     done
 
     total_unique=${#SEEN_THIS_POLL[@]}
-    echo "Resolving ${total_unique} unique remote host(s): ${cached_count} from cache, ${new_count} new lookup(s)."
+    echo "Resolving ${total_unique} unique remote host(s): ${cached_count} from cache, ${new_count} unresolved."
     resolve_start=$SECONDS
 
-    # Perform the actual lookups (status/timing printed by lookup_ip to stderr).
+    # --- Decide (in the parent) which IPs to actively probe this poll. All the
+    #     cache / grace / backoff bookkeeping stays here so the parallel workers
+    #     stay stateless.
     declare -A SEEN_LOOKUP=()
+    declare -a PROBE_IPS=() PROBE_PORTS=()
     for row in "${ROWS[@]}"; do
         remote="${row%%$'\t'*}"
         ip="${remote%:*}"; port="${remote##*:}"
         [[ -n "${SEEN_LOOKUP[$ip]+x}" ]] && continue
         SEEN_LOOKUP[$ip]=1
-        lookup_ip "$ip" "$port" >/dev/null
+
+        [[ -n "${NAME_CACHE[$ip]+x}" ]] && continue          # already resolved
+        [[ "$PROBE_ENABLED" -ne 1 ]] && continue             # --passive
+        [[ -z "${FIRST_SEEN[$ip]+x}" ]] && FIRST_SEEN[$ip]=$SECONDS
+        (( SECONDS - FIRST_SEEN[$ip] < PROBE_DELAY )) && continue   # grace period
+        if [[ -n "${LAST_TRY[$ip]+x}" ]] && (( SECONDS - LAST_TRY[$ip] < NEG_RETRY_WINDOW )); then
+            continue                                          # backoff after a failure
+        fi
+        PROBE_IPS+=("$ip"); PROBE_PORTS+=("$port")
     done
+
+    # --- Fire the probes in parallel, capped at MAX_PARALLEL concurrent workers.
+    if (( ${#PROBE_IPS[@]} > 0 )); then
+        echo "Self-probing ${#PROBE_IPS[@]} host(s), up to ${MAX_PARALLEL} in parallel..."
+        declare -a PROBE_PIDS=()
+        local_running=0
+        for i in "${!PROBE_IPS[@]}"; do
+            probe_ip "${PROBE_IPS[$i]}" "${PROBE_PORTS[$i]}" "$WORKDIR/result_${i}" &
+            PROBE_PIDS+=("$!")
+            # Throttle: 'wait -n' returns when the next job finishes. The collector
+            # never exits, so this effectively blocks on a probe completing.
+            (( ++local_running >= MAX_PARALLEL )) && { wait -n 2>/dev/null; local_running=$((local_running-1)); }
+        done
+        wait "${PROBE_PIDS[@]}" 2>/dev/null   # wait ONLY for probes, not the collector
+
+        # --- Merge probe results into the cache (parent-side, single-threaded).
+        for i in "${!PROBE_IPS[@]}"; do
+            ip="${PROBE_IPS[$i]}"
+            name=""; [[ -f "$WORKDIR/result_${i}" ]] && name="$(<"$WORKDIR/result_${i}")"
+            rm -f "$WORKDIR/result_${i}"
+            if [[ -n "$name" ]]; then
+                NAME_CACHE[$ip]="$name"; unset 'LAST_TRY[$ip]'
+            else
+                LAST_TRY[$ip]=$SECONDS
+            fi
+        done
+    fi
     resolve_elapsed=$(( SECONDS - resolve_start ))
     echo "Resolution pass complete in ${resolve_elapsed}s."
     echo ""

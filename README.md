@@ -93,29 +93,33 @@ At launch — before the first poll — a background collector starts so handsha
 are captured from `t=0`:
 
 ```bash
-# BPF below matches a TLS ClientHello on ANY tcp port (record type 22 + handshake type 1)
-tcpdump -i any -nn -U -s0 -w -  'tcp[((tcp[12]&0xf0)>>2)]=22 and tcp[((tcp[12]&0xf0)>>2)+5]=1' \
-  | tshark -r - -l -Q \
-      -Y 'tls.handshake.extensions_server_name' \
-      -T fields -e ip.dst -e ipv6.dst -e tls.handshake.extensions_server_name
+# tshark captures live itself (no tcpdump|tshark pipe, which can buffer to EOF)
+tshark -i any -l -Q -f 'tcp' \
+    -Y 'tls.handshake.extensions_server_name' \
+    -T fields -e ip.dst -e ipv6.dst -e tls.handshake.extensions_server_name
 ```
 
-`tcpdump` streams the live capture straight into `tshark` (tcpdump writes,
-tshark reads — via a pipe). Rather than a fixed port list, a BPF filter matches
-**TLS ClientHello packets on any port**, so HTTPS (443), AMQPS (5671), and other
-TLS services are all covered while the volume through the pipe stays tiny. For
-every ClientHello, `tshark` emits the destination IP and the **SNI**
-(`tls.handshake.extensions_server_name`) — the exact hostname the local
-application asked for. Each `ip → hostname` pair is appended to a mappings file
+`tshark` captures live on the wire directly. It watches **all TCP** (capture
+filter `tcp`, override with `COLLECTOR_CAPFILTER`) and lets its own TLS dissector
+pick out **ClientHellos on any port** — HTTPS (443), AMQPS (5671), etc. — rather
+than relying on a fragile byte-offset BPF that can silently match nothing on an
+`any`/cooked capture. Doing the capture inside `tshark` also avoids the
+`tcpdump -w - | tshark -r -` pipe, which on some builds buffers until EOF and so
+emits nothing for a live stream. For every ClientHello, `tshark` emits the
+destination IP and the **SNI** (`tls.handshake.extensions_server_name`) — the
+exact hostname the local application asked for. Each `ip → hostname` pair is
+appended to a mappings file
 that the main loop folds into the cache on every poll. Because it runs in
 parallel, the application's own connections are resolved with zero added latency.
 
-### 2. Active self-probe (automatic fallback after `PROBE_DELAY`)
+### 2. Active self-probe (automatic fallback after `PROBE_DELAY`, run in parallel)
 
 Long-lived or pre-existing connections never send a *fresh* ClientHello, so the
 passive collector can't see them. If an IP stays unresolved for `PROBE_DELAY`
 seconds (default 10; `0` = immediate via `--active`; disabled by `--passive`),
-the script probes it with a targeted, minimal-duration lookup:
+the script probes it with a targeted, minimal-duration lookup. **Probes run
+concurrently** (up to `MAX_PARALLEL`, default 16), so a poll with a dozen
+unresolved hosts finishes in ~1s instead of ~1s × N:
 
 ```bash
 tcpdump -i any -nn host <IP> and port <PORT> -s0 -w tracedump.pcap        # capture just this host
@@ -203,10 +207,12 @@ If you're not root, it automatically prefixes capture commands with `sudo`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `POLL_INTERVAL` | `10` | Seconds between netstat polls |
-| `CAPTURE_IFACE` | `any` | Interface passed to `tcpdump -i` |
+| `CAPTURE_IFACE` | `any` | Interface passed to `tshark -i` / `tcpdump -i` |
+| `COLLECTOR_CAPFILTER` | `tcp` | Capture filter for the passive collector; narrow it on very busy hosts, e.g. `'tcp port 443 or tcp port 5671'` |
 | `PROBE_DELAY` | `10` | Seconds an IP may stay unresolved before self-probing (`0` = immediate, same as `--active`) |
-| `TRIGGER_TIMEOUT` | `4` | Max seconds to wait on our own handshake (active lookup) |
-| `MAX_CAPTURE` | `6` | Hard cap on tcpdump duration per active lookup |
+| `MAX_PARALLEL` | `16` | Max concurrent self-probes (bounds how many outbound connections we open at once) |
+| `TRIGGER_TIMEOUT` | `4` | Max seconds to wait on our own handshake (per probe) |
+| `MAX_CAPTURE` | `6` | Hard cap on tcpdump duration per probe |
 | `NEG_RETRY_WINDOW` | `300` | Seconds before a failed IP is retried |
 
 Example:
