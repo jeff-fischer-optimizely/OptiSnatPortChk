@@ -520,6 +520,9 @@ while true; do
             if (pid == "" || pid == "-") pid = "N/A";
             if (prog == "" || prog == "-") prog = "kernel";
 
+            # Filter out connections from our own probe tools (openssl, curl, timeout wrapper)
+            if (prog ~ /^(openssl|curl|timeout)$/) next;
+
             if (localPort !~ /^(80|443|2222)$/) {
                 key = foreignAddr;
                 if (group_by_pid == 1) key = key " " pid " " prog;
