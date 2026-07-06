@@ -623,9 +623,9 @@ while true; do
     vlog "Resolution pass complete in ${resolve_elapsed}s."
     vlog ""
 
-    # --- Render the enriched table: IP, DNS, and Service(Port) as columns.
+    # --- Render the enriched table: IP, DNS, Service(Port), PID(process-name) as columns.
     [[ -n "$TCP_STATES" ]] && echo "Filtered to TCP state(s): ${STATE_REGEX//|/, }"
-    printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "Remote IP" "DNS" "Service (Port)" "PID" "Process" "Total" "States (Count)"
+    printf "%-20s %-46s %-16s %-18s %-7s %s\n" "Remote IP" "DNS" "Service (Port)" "PID" "Total" "States (Count)"
     printf '%.0s-' {1..140}; echo
 
     unresolved=0
@@ -643,7 +643,9 @@ while true; do
             name="-"
             unresolved=$((unresolved+1))
         fi
-        printf "%-20s %-46s %-16s %-7s %-18s %-7s %s\n" "$ip" "$name" "$svc" "$pid" "$prog" "$total" "$states"
+        # Format PID column as "PID (process-name)"
+        pid_col="${pid} (${prog})"
+        printf "%-20s %-46s %-16s %-18s %-7s %s\n" "$ip" "$name" "$svc" "$pid_col" "$total" "$states"
     done
 
     printf '%.0s-' {1..140}; echo

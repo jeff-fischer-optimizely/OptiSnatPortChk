@@ -15,25 +15,25 @@ with the real `hostname:port` discovered by sniffing TLS handshakes locally.
 Default (passive — names come from the app's own TLS handshakes):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && ./snatportchk.sh
 ```
 
 Probe immediately, no grace period (`-a` / `--active`):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && ./snatportchk.sh --active
 ```
 
 **Only `TIME_WAIT`** connections, with active probing (the SNAT-port-pressure view):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --active --tcp-state TIME_WAIT
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && ./snatportchk.sh --active --tcp-state TIME_WAIT
 ```
 
 Group rows by PID (`--pid`, alias of `-p` / `--group-by-pid`):
 
 ```bash
-curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && sudo ./snatportchk.sh --pid
+curl -s https://raw.githubusercontent.com/jeff-fischer-optimizely/OptiSnatPortChk/main/snatportchk.sh -o snatportchk.sh && chmod +x snatportchk.sh && ./snatportchk.sh --pid
 ```
 
 See [Run](#run) below for what each flag does.
@@ -41,12 +41,12 @@ See [Run](#run) below for what each flag does.
 ## Run
 
 ```bash
-sudo ./snatportchk.sh                       # sudo/root is required — tcpdump needs raw sockets
-sudo ./snatportchk.sh --pid                 # (alias: -p / --group-by-pid) group rows by PID, like the original
-sudo ./snatportchk.sh --active              # (or -a) enable the active self-probe fallback (off by default)
-sudo ./snatportchk.sh --passive             # (or --no-probe) passive collector only (this is the default)
-sudo ./snatportchk.sh --tcp-state TIME_WAIT # only show connections in this state (comma-separate for several)
-sudo ./snatportchk.sh --verbose             # (or -v) show per-poll diagnostics; default prints just the table
+./snatportchk.sh                       # sudo/root is required — tcpdump needs raw sockets
+./snatportchk.sh --pid                 # (alias: -p / --group-by-pid) group rows by PID, like the original
+./snatportchk.sh --active              # (or -a) enable the active self-probe fallback (off by default)
+./snatportchk.sh --passive             # (or --no-probe) passive collector only (this is the default)
+./snatportchk.sh --tcp-state TIME_WAIT # only show connections in this state (comma-separate for several)
+./snatportchk.sh --verbose             # (or -v) show per-poll diagnostics; default prints just the table
 ```
 
 **To stop:** press **`q`** (or **Ctrl-C**) — either one shuts down the background
@@ -201,8 +201,7 @@ Missing **required** tools trigger an interactive `apt-get install` prompt at
 startup (apt only — matching the original script). On non-apt systems you're told
 to install them manually.
 
-`tcpdump` needs raw-socket privileges, so run the script with `sudo` / as root.
-If you're not root, it automatically prefixes capture commands with `sudo`.
+`tcpdump` needs raw-socket privileges. If you're not root, the script automatically prefixes capture commands with `sudo`.
 
 ---
 
@@ -222,7 +221,7 @@ If you're not root, it automatically prefixes capture commands with `sudo`.
 Example:
 
 ```bash
-sudo POLL_INTERVAL=5 CAPTURE_IFACE=eth0 ./snatportchk.sh
+POLL_INTERVAL=5 CAPTURE_IFACE=eth0 ./snatportchk.sh
 ```
 
 ---
